@@ -8,13 +8,22 @@ from pydantic import BaseModel
 import pulp
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gridwise")
 
 app = FastAPI(title="GridWise API", docs_url=None, redoc_url=None)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # 1. Schemas[cite: 1, 2]
 class HourData(BaseModel):
