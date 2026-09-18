@@ -1,0 +1,6 @@
+{
+  "name": "GridWise Energy Optimization API",
+  "description": "Smart Campus Energy Optimization API with LLM-assisted operator directive interpretation and linear programming energy scheduling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
