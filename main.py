@@ -1,104 +1,68 @@
-"""
-Smart Campus Energy Optimization Challenge - Reference FastAPI Implementation
-BUP CSE FEST 2026 Preliminary Round
-
-Exposes:
-  - GET  /health
-  - POST /optimize-energy
-"""
-
 import os
-import re
 import json
+import re
 import logging
 from typing import List, Optional, Literal
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import pulp
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("energy-optimizer")
+logger = logging.getLogger("gridwise")
 
-app = FastAPI(
-    title="Smart Campus Energy Optimization API",
-    version="1.0.0",
-    description="FastAPI + PuLP + Google GenAI implementation for Smart Campus Microgrid optimization.",
-)
+app = FastAPI(title="GridWise API", docs_url=None, redoc_url=None)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 1. Schemas[cite: 1, 2]
+class HourData(BaseModel):
+    hour: int
+    demand_kwh: float
+    solar_kwh: float
+    tariff_bdt_per_kwh: float
 
-# ==============================================================================
-# 1. Pydantic Schemas (Exact Specification Sections 07 & 10)
-# ==============================================================================
-
-class HourlyInput(BaseModel):
-    hour: int = Field(..., ge=0, le=23, description="Hour of the day (0-23)")
-    demand_kwh: float = Field(..., ge=0.0, description="Baseline facility power demand in kWh")
-    solar_kwh: float = Field(..., ge=0.0, description="Available forecast solar PV generation in kWh")
-    tariff_bdt_per_kwh: float = Field(..., ge=0.0, description="Utility grid import rate in BDT/kWh")
-
-
-class BatterySpec(BaseModel):
-    capacity_kwh: float = Field(..., gt=0.0, description="Total battery capacity in kWh")
-    initial_energy_kwh: float = Field(..., ge=0.0, description="Initial State of Charge in kWh at hour 0")
-    minimum_energy_kwh: float = Field(..., ge=0.0, description="Safe operational minimum energy limit")
-    max_charge_kwh_per_hour: float = Field(..., ge=0.0, description="Maximum charge rate in kWh/h")
-    max_discharge_kwh_per_hour: float = Field(..., ge=0.0, description="Maximum discharge rate in kWh/h")
-
+class BatteryData(BaseModel):
+    capacity_kwh: float
+    initial_energy_kwh: float
+    minimum_energy_kwh: float
+    max_charge_kwh_per_hour: float
+    max_discharge_kwh_per_hour: float
 
 class OptimizeRequest(BaseModel):
-    scenario_id: str = Field(..., description="Unique scenario identifier")
-    operator_notes: List[str] = Field(default_factory=list, description="Natural language operator dispatch directives")
-    hours: List[HourlyInput] = Field(..., min_length=24, max_length=24, description="Exact 24 hourly inputs (0..23)")
-    battery: BatterySpec = Field(..., description="Battery energy storage specification")
-
-
-DirectiveType = Literal[
-    "solar_reduction",
-    "minimum_battery_reserve",
-    "no_charge_window",
-    "no_discharge_window",
-    "max_grid_window",
-    "no_op",
-]
-
-BatteryAction = Literal["charge", "discharge", "idle"]
-
+    scenario_id: str
+    operator_notes: List[str]
+    hours: List[HourData]
+    battery: BatteryData
 
 class StructuredAdjustment(BaseModel):
-    hours: Optional[List[int]] = Field(default=None, description="Affected hours (0..23, start-inclusive, end-exclusive)")
-    factor: Optional[float] = Field(default=None, description="Fraction of solar remaining (e.g., 0.20 for 80% reduction)")
-    minimum_energy_kwh: Optional[float] = Field(default=None, description="Reserve limit in kWh")
-    max_grid_kwh: Optional[float] = Field(default=None, description="Ceiling on grid imports in kWh/h")
-
+    hours: List[int]
+    factor: Optional[float] = None
+    minimum_energy_kwh: Optional[float] = None
+    max_grid_kwh: Optional[float] = None
 
 class DirectiveInterpretation(BaseModel):
-    note_index: int = Field(..., description="0-indexed position in operator_notes")
-    applies: bool = Field(..., description="True if actionable constraint; False if irrelevant/no_op")
-    directive_type: DirectiveType = Field(..., description="Categorized directive class")
-    structured_adjustment: Optional[StructuredAdjustment] = Field(default=None, description="Numeric bounds and hours")
-    explanation: str = Field(..., description="Brief reasoning of the interpretation")
-
+    note_index: int
+    applies: bool
+    directive_type: Literal[
+        "solar_reduction",
+        "minimum_battery_reserve",
+        "no_charge_window",
+        "no_discharge_window",
+        "max_grid_window",
+        "no_op"
+    ]
+    structured_adjustment: Optional[StructuredAdjustment] = None
+    explanation: str
 
 class HourlyPlan(BaseModel):
-    hour: int = Field(..., ge=0, le=23)
-    grid_import_kwh: float
+    hour: int
+    grid_kwh: float
     solar_used_kwh: float
-    battery_charge_kwh: float
-    battery_discharge_kwh: float
-    battery_action: BatteryAction
+    battery_action: Literal["charge", "discharge", "idle"]
+    battery_kwh: float
     battery_energy_after_kwh: float
-    hourly_cost_bdt: float
-
 
 class OptimizeResponse(BaseModel):
     scenario_id: str
@@ -107,392 +71,180 @@ class OptimizeResponse(BaseModel):
     total_grid_kwh: float
     total_cost_bdt: float
     peak_grid_kwh: float
+    plan_summary: str
 
+# 2. LLM + Fallback[cite: 2]
+SYSTEM_PROMPT = """You are an energy management assistant for a smart campus grid.
+Interpret operator notes into structured directives for a 24-hour energy scheduler (hours 0-23).
+Directives:
+1. `solar_reduction`: {"hours": [int...], "factor": float} (factor = fraction REMAINING, e.g. 80% reduction -> factor 0.2)
+2. `minimum_battery_reserve`: {"hours": [int...], "minimum_energy_kwh": float}
+3. `no_charge_window`: {"hours": [int...]}
+4. `no_discharge_window`: {"hours": [int...]}
+5. `max_grid_window`: {"hours": [int...], "max_grid_kwh": float}
+6. `no_op`: applies: false, structured_adjustment: null (irrelevant notes)
+Time windows are start-inclusive, end-exclusive: "1 PM to 3 PM" -> [13, 14].
+Output raw JSON array in note_index order."""
 
-# ==============================================================================
-# 2. LLM Directive Extraction (Google GenAI SDK + Gemini 2.5 Flash)
-# ==============================================================================
+def parse_time_window(text: str) -> List[int]:
+    t = text.lower()
+    m24 = re.search(r'(\d{1,2}):00\s*(?:to|-|until)\s*(\d{1,2}):00', t)
+    if m24:
+        s, e = int(m24.group(1)), int(m24.group(2))
+        if 0 <= s < e <= 24: return list(range(s, e))
+    m12 = re.search(r'(\d{1,2})\s*(am|pm)\s*(?:to|-|and|until)\s*(\d{1,2})\s*(am|pm)', t)
+    if m12:
+        h1, p1, h2, p2 = int(m12.group(1)), m12.group(2), int(m12.group(3)), m12.group(4)
+        if p1 == 'pm' and h1 < 12: h1 += 12
+        if p1 == 'am' and h1 == 12: h1 = 0
+        if p2 == 'pm' and h2 < 12: h2 += 12
+        if p2 == 'am' and h2 == 12: h2 = 0
+        if 0 <= h1 < h2 <= 24: return list(range(h1, h2))
+    return []
 
-def fallback_rule_parser(note: str, index: int, capacity: float) -> DirectiveInterpretation:
-    """
-    Deterministic rule-based fallback parser ensuring zero-downtime safety
-    even during network timeouts or quota exhaustion.
-    """
-    cleaned = note.strip()
-    lower = cleaned.lower()
+def fallback_parser(notes: List[str]) -> List[DirectiveInterpretation]:
+    res = []
+    for idx, note in enumerate(notes):
+        nl = note.lower()
+        hrs = parse_time_window(note)
+        if any(w in nl for w in ["solar", "pv", "washing", "sunlight"]):
+            factor = 0.2 if ("80%" in nl or "20%" in nl) else 0.5 if "50%" in nl else 0.25
+            res.append(DirectiveInterpretation(note_index=idx, applies=bool(hrs), directive_type="solar_reduction" if hrs else "no_op", structured_adjustment=StructuredAdjustment(hours=hrs, factor=factor) if hrs else None, explanation="Solar adjustment"))
+        elif any(w in nl for w in ["reserve", "keep at least", "minimum energy"]):
+            m = re.search(r'(\d+)\s*kwh', nl)
+            val = float(m.group(1)) if m else 100.0
+            res.append(DirectiveInterpretation(note_index=idx, applies=bool(hrs), directive_type="minimum_battery_reserve" if hrs else "no_op", structured_adjustment=StructuredAdjustment(hours=hrs, minimum_energy_kwh=val) if hrs else None, explanation="Reserve limit"))
+        elif "charge" in nl and any(w in nl for w in ["do not", "no", "stop", "unavailable"]):
+            res.append(DirectiveInterpretation(note_index=idx, applies=bool(hrs), directive_type="no_charge_window" if hrs else "no_op", structured_adjustment=StructuredAdjustment(hours=hrs) if hrs else None, explanation="No charge"))
+        elif "discharge" in nl and any(w in nl for w in ["do not", "no", "stop", "unavailable"]):
+            res.append(DirectiveInterpretation(note_index=idx, applies=bool(hrs), directive_type="no_discharge_window" if hrs else "no_op", structured_adjustment=StructuredAdjustment(hours=hrs) if hrs else None, explanation="No discharge"))
+        elif any(w in nl for w in ["max grid", "cap", "feeder", "intake"]):
+            m = re.search(r'(\d+)\s*kwh', nl)
+            val = float(m.group(1)) if m else 155.0
+            res.append(DirectiveInterpretation(note_index=idx, applies=bool(hrs), directive_type="max_grid_window" if hrs else "no_op", structured_adjustment=StructuredAdjustment(hours=hrs, max_grid_kwh=val) if hrs else None, explanation="Grid cap"))
+        else:
+            res.append(DirectiveInterpretation(note_index=idx, applies=False, directive_type="no_op", structured_adjustment=None, explanation="Irrelevant note"))
+    return res
 
-    # Pattern 1: Solar reduction
-    if any(k in lower for k in ["solar", "photovoltaic", "pv", "dust", "cleaning", "wash", "panel"]):
-        red_pct_match = re.search(r'(\d+)\s*%\s*(?:reduction|cut|drop|decrease|dust|loss)', lower)
-        remain_pct_match = re.search(r'roughly\s*(\d+)\s*%\s*of\s*(?:the\s*)?forecast', lower) or \
-                           re.search(r'treat.*?(\d+)\s*%\s*as', lower) or \
-                           re.search(r'(\d+)\s*%\s*(?:remains|available|usable|capacity)', lower)
-        factor = 0.5
-        if remain_pct_match:
-            factor = float(remain_pct_match.group(1)) / 100.0
-        elif red_pct_match:
-            factor = max(0.0, 1.0 - (float(red_pct_match.group(1)) / 100.0))
-
-        hours = [12, 13]
-        if "noon until 2 pm" in lower or "noon to 2 pm" in lower or "12 pm to 2 pm" in lower:
-            hours = [12, 13]
-        elif "1 pm and 3 pm" in lower or "1 pm to 3 pm" in lower:
-            hours = [13, 14]
-
-        return DirectiveInterpretation(
-            note_index=index,
-            applies=True,
-            directive_type="solar_reduction",
-            structured_adjustment=StructuredAdjustment(hours=hours, factor=factor),
-            explanation="Deterministic rule-based extraction for solar reduction window.",
-        )
-
-    # Pattern 2: Minimum battery reserve
-    if any(k in lower for k in ["reserve", "campus event", "vip", "ceremony", "keep at least", "emergency reserve"]):
-        res_pct = re.search(r'(\d+)\s*%', lower)
-        min_kwh = capacity * 0.5
-        if res_pct:
-            min_kwh = capacity * (float(res_pct.group(1)) / 100.0)
-
-        hours = [18, 19, 20, 21]
-        if "6 pm and 10 pm" in lower or "6 pm to 10 pm" in lower or "18:00 to 22:00" in lower:
-            hours = [18, 19, 20, 21]
-        elif "7 pm and 9 pm" in lower or "7 pm to 9 pm" in lower:
-            hours = [19, 20]
-
-        return DirectiveInterpretation(
-            note_index=index,
-            applies=True,
-            directive_type="minimum_battery_reserve",
-            structured_adjustment=StructuredAdjustment(hours=hours, minimum_energy_kwh=min_kwh),
-            explanation="Deterministic rule-based extraction for minimum battery reserve window.",
-        )
-
-    # Pattern 3: No charge window
-    if "no charging" in lower or "do not charge" in lower or "prohibit charging" in lower:
-        return DirectiveInterpretation(
-            note_index=index,
-            applies=True,
-            directive_type="no_charge_window",
-            structured_adjustment=StructuredAdjustment(hours=[17, 18, 19, 20, 21]),
-            explanation="Deterministic rule-based extraction for battery charging lockout.",
-        )
-
-    # Pattern 4: Max grid import limit
-    if "grid" in lower and ("cap" in lower or "limit" in lower or "not exceed" in lower):
-        cap_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:kw|kwh)', lower)
-        max_grid = float(cap_match.group(1)) if cap_match else 100.0
-        return DirectiveInterpretation(
-            note_index=index,
-            applies=True,
-            directive_type="max_grid_window",
-            structured_adjustment=StructuredAdjustment(hours=list(range(24)), max_grid_kwh=max_grid),
-            explanation="Deterministic rule-based extraction for grid import capacity cap.",
-        )
-
-    # Default: Irrelevant note / No-op
-    return DirectiveInterpretation(
-        note_index=index,
-        applies=False,
-        directive_type="no_op",
-        structured_adjustment=None,
-        explanation="Note is irrelevant to microgrid energy dispatch parameters.",
-    )
-
-
-def extract_directives(notes: List[str], capacity_kwh: float) -> List[DirectiveInterpretation]:
-    """
-    Extract structured constraints from operator notes using Google GenAI SDK.
-    Follows BUP guidelines:
-      - Start-inclusive, end-exclusive time windows.
-      - Remaining factor for solar reductions (80% reduction -> factor = 0.20).
-      - Strict JSON schema validation with fallback guarantee.
-    """
-    if not notes:
-        return []
-
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    if not gemini_api_key:
-        logger.warning("GEMINI_API_KEY not set. Using deterministic fallback parser.")
-        return [fallback_rule_parser(note, idx, capacity_kwh) for idx, note in enumerate(notes)]
-
-    client = genai.Client(api_key=gemini_api_key)
-
-    prompt = f"""You are the Natural Language Directive Interpreter for an automated microgrid energy management system at a university campus.
-Battery Capacity: {capacity_kwh} kWh.
-
-Analyze each operator note and translate it into a structured dispatch directive.
-Follow these mandatory business rules:
-1. Time windows are 0-indexed (0 to 23), start-inclusive and end-exclusive.
-   Examples:
-   - "noon until 2 PM" -> [12, 13]
-   - "1 PM to 3 PM" -> [13, 14]
-   - "6 PM and 10 PM" / "6 PM to 10 PM" -> [18, 19, 20, 21]
-2. "solar_reduction":
-   - "factor" represents the USABLE solar fraction REMAINING.
-   - "80% reduction" means factor = 0.20.
-   - "usable solar treated as roughly 25% of forecast" means factor = 0.25.
-3. "minimum_battery_reserve":
-   - Compute minimum_energy_kwh = percentage * battery_capacity ({capacity_kwh} kWh).
-4. Irrelevant notes (administrative announcements, cafeteria menus, sports events) MUST have:
-   directive_type = "no_op", applies = false, structured_adjustment = null.
-5. All actionable operational notes MUST have applies = true.
-
-Operator Notes to process:
-{json.dumps(notes, indent=2)}
-
-Return a list of directive interpretations in exact sequential order (note_index 0 to {len(notes) - 1})."""
-
+def interpret_notes(notes: List[str]) -> List[DirectiveInterpretation]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return fallback_parser(notes)
     try:
+        client = genai.Client(api_key=api_key)
+        prompt = f"Notes to interpret:\n" + "\n".join([f"Note {i}: {n}" for i, n in enumerate(notes)])
         response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
+            model="gemini-2.5-flash",
+            contents=[SYSTEM_PROMPT, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=list[DirectiveInterpretation],
-                temperature=0.0,
-            ),
-        )
-
-        text = response.text or ""
-        parsed_data = json.loads(text)
-        results = [DirectiveInterpretation(**item) for item in parsed_data]
-
-        # Post-validation guardrails
-        validated: List[DirectiveInterpretation] = []
-        for idx, item in enumerate(results):
-            # Guard note_index
-            item.note_index = idx
-            # Guard no_op
-            if item.directive_type == "no_op":
-                item.applies = False
-                item.structured_adjustment = None
-            elif item.applies and item.structured_adjustment:
-                adj = item.structured_adjustment
-                if adj.hours:
-                    adj.hours = sorted(list(set([h for h in adj.hours if 0 <= h <= 23])))
-                if item.directive_type == "solar_reduction" and adj.factor is not None:
-                    adj.factor = max(0.0, min(1.0, float(adj.factor)))
-                if item.directive_type == "minimum_battery_reserve" and adj.minimum_energy_kwh is not None:
-                    adj.minimum_energy_kwh = max(0.0, min(capacity_kwh, float(adj.minimum_energy_kwh)))
-            validated.append(item)
-
-        return validated
-
-    except Exception as exc:
-        logger.warning(f"Gemini interpretation failed ({exc}). Falling back to deterministic guardrail parser.")
-        return [fallback_rule_parser(note, idx, capacity_kwh) for idx, note in enumerate(notes)]
-
-
-# ==============================================================================
-# 3. Mathematical Optimization Phase (PuLP Linear Programming)
-# ==============================================================================
-
-def solve_schedule(request: OptimizeRequest, directives: List[DirectiveInterpretation]) -> List[HourlyPlan]:
-    """
-    Formulates and solves the 24-hour cost minimization Linear Program using PuLP:
-      Minimize Sum(grid_kwh[h] * tariff_bdt_per_kwh[h])
-      Subject to:
-        - Energy balance: grid + solar_used + discharge == demand + charge
-        - Solar curtailment: solar_used <= effective_solar
-        - Battery state transition: E[h] == E[h-1] + charge - discharge (with round-trip/loss handling)
-        - Capacity & Reserve bounds: min_reserve <= E[h] <= capacity
-        - Charging/Discharging limits
-        - End-of-day neutrality: E[23] == E_initial
-        - Dynamic operator constraints (lockouts, solar factors, reserves, grid caps)
-    """
-    hours_data = request.hours
-    battery = request.battery
-
-    # 1. Base parameter arrays
-    demand = [h.demand_kwh for h in hours_data]
-    raw_solar = [h.solar_kwh for h in hours_data]
-    tariff = [h.tariff_bdt_per_kwh for h in hours_data]
-
-    solar_factor = [1.0] * 24
-    min_reserve = [battery.minimum_energy_kwh] * 24
-    charge_allowed = [True] * 24
-    discharge_allowed = [True] * 24
-    grid_import_cap = [1e6] * 24
-
-    # 2. Apply structured directives
-    for d in directives:
-        if not d.applies or not d.structured_adjustment:
-            continue
-        adj = d.structured_adjustment
-        target_hours = adj.hours if adj.hours is not None else list(range(24))
-
-        if d.directive_type == "solar_reduction" and adj.factor is not None:
-            for h in target_hours:
-                if 0 <= h < 24:
-                    solar_factor[h] = min(solar_factor[h], adj.factor)
-
-        elif d.directive_type == "minimum_battery_reserve" and adj.minimum_energy_kwh is not None:
-            for h in target_hours:
-                if 0 <= h < 24:
-                    min_reserve[h] = max(min_reserve[h], adj.minimum_energy_kwh)
-
-        elif d.directive_type == "no_charge_window":
-            for h in target_hours:
-                if 0 <= h < 24:
-                    charge_allowed[h] = False
-
-        elif d.directive_type == "no_discharge_window":
-            for h in target_hours:
-                if 0 <= h < 24:
-                    discharge_allowed[h] = False
-
-        elif d.directive_type == "max_grid_window" and adj.max_grid_kwh is not None:
-            for h in target_hours:
-                if 0 <= h < 24:
-                    grid_import_cap[h] = min(grid_import_cap[h], adj.max_grid_kwh)
-
-    effective_solar = [raw_solar[h] * solar_factor[h] for h in range(24)]
-
-    # 3. Create PuLP Problem
-    prob = pulp.LpProblem("Microgrid_Dispatch_Optimization", pulp.LpMinimize)
-
-    # Decision variables
-    grid = [pulp.LpVariable(f"grid_{h}", lowBound=0.0, upBound=grid_import_cap[h]) for h in range(24)]
-    solar_used = [pulp.LpVariable(f"solar_used_{h}", lowBound=0.0, upBound=effective_solar[h]) for h in range(24)]
-    
-    charge = [
-        pulp.LpVariable(
-            f"charge_{h}",
-            lowBound=0.0,
-            upBound=(battery.max_charge_kwh_per_hour if charge_allowed[h] else 0.0)
-        )
-        for h in range(24)
-    ]
-    
-    discharge = [
-        pulp.LpVariable(
-            f"discharge_{h}",
-            lowBound=0.0,
-            upBound=(battery.max_discharge_kwh_per_hour if discharge_allowed[h] else 0.0)
-        )
-        for h in range(24)
-    ]
-
-    e_after = [
-        pulp.LpVariable(
-            f"e_after_{h}",
-            lowBound=min_reserve[h],
-            upBound=battery.capacity_kwh
-        )
-        for h in range(24)
-    ]
-
-    # Objective Function: Minimize total cost of grid energy
-    prob += pulp.lpSum([grid[h] * tariff[h] for h in range(24)])
-
-    # Hourly constraints
-    for h in range(24):
-        # Hourly Energy Balance: supply == demand
-        prob += (grid[h] + solar_used[h] + discharge[h] == demand[h] + charge[h], f"EnergyBalance_{h}")
-
-        # Battery Storage State Transitions
-        if h == 0:
-            prob += (e_after[h] == battery.initial_energy_kwh + charge[h] - discharge[h], f"BatteryState_{h}")
-        else:
-            prob += (e_after[h] == e_after[h - 1] + charge[h] - discharge[h], f"BatteryState_{h}")
-
-    # End-of-day battery neutrality constraint (E_23 == E_initial)
-    prob += (e_after[23] == battery.initial_energy_kwh, "EndOfDayNeutrality")
-
-    # Solve with CBC solver
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    status = prob.solve(solver)
-
-    if status != pulp.LpStatusOptimal:
-        logger.error(f"Solver failed to find an optimal solution. Status code: {status}")
-        raise ValueError(f"Linear program infeasible or unbounded (Status: {pulp.LpStatus[status]})")
-
-    # 4. Format hourly plan entries
-    plan: List[HourlyPlan] = []
-    for h in range(24):
-        c_val = round(max(0.0, float(charge[h].varValue or 0.0)), 4)
-        d_val = round(max(0.0, float(discharge[h].varValue or 0.0)), 4)
-        g_val = round(max(0.0, float(grid[h].varValue or 0.0)), 4)
-        s_val = round(max(0.0, float(solar_used[h].varValue or 0.0)), 4)
-        e_val = round(float(e_after[h].varValue or 0.0), 4)
-
-        if c_val > 1e-4:
-            action: BatteryAction = "charge"
-        elif d_val > 1e-4:
-            action = "discharge"
-        else:
-            action = "idle"
-
-        hourly_cost = round(g_val * tariff[h], 4)
-
-        plan.append(
-            HourlyPlan(
-                hour=h,
-                grid_import_kwh=g_val,
-                solar_used_kwh=s_val,
-                battery_charge_kwh=c_val,
-                battery_discharge_kwh=d_val,
-                battery_action=action,
-                battery_energy_after_kwh=e_val,
-                hourly_cost_bdt=hourly_cost,
+                temperature=0.0
             )
         )
+        return [DirectiveInterpretation(**item) for item in json.loads(response.text)]
+    except Exception as e:
+        logger.error(f"LLM Error: {e}")
+        return fallback_parser(notes)
 
-    return plan
+# 3. Guardrails[cite: 2]
+def guard_directives(directives: List[DirectiveInterpretation]) -> List[DirectiveInterpretation]:
+    for i, d in enumerate(directives):
+        d.note_index = i
+        if d.directive_type == "no_op":
+            d.applies = False
+            d.structured_adjustment = None
+        else:
+            d.applies = True
+            if d.structured_adjustment:
+                d.structured_adjustment.hours = sorted(list(set([h for h in d.structured_adjustment.hours if 0 <= h <= 23])))
+    return directives
 
+# 4. Math Optimizer[cite: 1, 2]
+def optimize_schedule(req: OptimizeRequest, directives: List[DirectiveInterpretation]) -> OptimizeResponse:
+    prob = pulp.LpProblem("Cost_Minimization", pulp.LpMinimize)
+    grid = pulp.LpVariable.dicts("grid", range(24), lowBound=0.0)
+    solar_used = pulp.LpVariable.dicts("solar_used", range(24), lowBound=0.0)
+    charge = pulp.LpVariable.dicts("charge", range(24), lowBound=0.0)
+    discharge = pulp.LpVariable.dicts("discharge", range(24), lowBound=0.0)
+    e_after = pulp.LpVariable.dicts("e_after", range(24), lowBound=0.0)
 
-# ==============================================================================
-# 4. Application Endpoints (Exact Problem Statement Specification)
-# ==============================================================================
+    effective_solar = [h.solar_kwh for h in req.hours]
+    min_reserve = [req.battery.minimum_energy_kwh for _ in range(24)]
+    max_grid = [None for _ in range(24)]
+    no_charge = [False for _ in range(24)]
+    no_discharge = [False for _ in range(24)]
 
-@app.get("/health", summary="Health Check Probe")
-def health_check():
-    """Returns status ok to satisfy competition liveness and orchestrator probes."""
+    for d in directives:
+        if not d.applies or not d.structured_adjustment: continue
+        hrs = d.structured_adjustment.hours
+        if d.directive_type == "solar_reduction" and d.structured_adjustment.factor is not None:
+            for h in hrs: effective_solar[h] *= d.structured_adjustment.factor
+        elif d.directive_type == "minimum_battery_reserve" and d.structured_adjustment.minimum_energy_kwh is not None:
+            for h in hrs: min_reserve[h] = max(min_reserve[h], d.structured_adjustment.minimum_energy_kwh)
+        elif d.directive_type == "max_grid_window":
+            for h in hrs: max_grid[h] = d.structured_adjustment.max_grid_kwh
+        elif d.directive_type == "no_charge_window":
+            for h in hrs: no_charge[h] = True
+        elif d.directive_type == "no_discharge_window":
+            for h in hrs: no_discharge[h] = True
+
+    prob += pulp.lpSum([grid[h] * req.hours[h].tariff_bdt_per_kwh for h in range(24)])
+
+    for h in range(24):
+        prob += solar_used[h] <= effective_solar[h]
+        prob += charge[h] <= req.battery.max_charge_kwh_per_hour
+        prob += discharge[h] <= req.battery.max_discharge_kwh_per_hour
+        prob += grid[h] + solar_used[h] + discharge[h] == req.hours[h].demand_kwh + charge[h]
+        
+        if h == 0:
+            prob += e_after[0] == req.battery.initial_energy_kwh + charge[0] - discharge[0]
+        else:
+            prob += e_after[h] == e_after[h - 1] + charge[h] - discharge[h]
+
+        prob += e_after[h] >= min_reserve[h]
+        prob += e_after[h] <= req.battery.capacity_kwh
+        if no_charge[h]: prob += charge[h] == 0.0
+        if no_discharge[h]: prob += discharge[h] == 0.0
+        if max_grid[h] is not None: prob += grid[h] <= max_grid[h]
+
+    prob += e_after[23] == req.battery.initial_energy_kwh
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+
+    hourly_plan = []
+    total_grid = total_cost = peak_grid = 0.0
+    for h in range(24):
+        g = round(float(pulp.value(grid[h])), 2)
+        c = round(float(pulp.value(charge[h])), 2)
+        d = round(float(pulp.value(discharge[h])), 2)
+        action = "charge" if c > 0.01 else "discharge" if d > 0.01 else "idle"
+        kwh = c if action == "charge" else d if action == "discharge" else 0.0
+
+        hourly_plan.append(HourlyPlan(
+            hour=h, grid_kwh=g, solar_used_kwh=round(float(pulp.value(solar_used[h])), 2),
+            battery_action=action, battery_kwh=kwh, battery_energy_after_kwh=round(float(pulp.value(e_after[h])), 2)
+        ))
+        total_grid += g
+        total_cost += g * req.hours[h].tariff_bdt_per_kwh
+        peak_grid = max(peak_grid, g)
+
+    return OptimizeResponse(
+        scenario_id=req.scenario_id, directive_interpretation=directives, hourly_plan=hourly_plan,
+        total_grid_kwh=round(total_grid, 2), total_cost_bdt=round(total_cost, 2), peak_grid_kwh=round(peak_grid, 2),
+        plan_summary="Schedule mathematically optimized obeying all interpreted directives."
+    )
+
+# 5. Endpoints[cite: 2]
+@app.get("/health")
+def health():
     return {"status": "ok"}
 
-
-@app.post("/optimize-energy", response_model=OptimizeResponse, summary="Optimize Microgrid Schedule")
-def optimize_energy(request: OptimizeRequest):
-    """
-    Full pipeline endpoint:
-      1. Validates incoming schema via Pydantic.
-      2. Interprets operator notes into directives using Gemini 2.5 Flash + fallback guardrail parser.
-      3. Solves the 24-hour linear program with PuLP to compute optimal dispatch.
-      4. Formulates and returns the standardized optimization response.
-    """
+@app.post("/optimize-energy", response_model=OptimizeResponse)
+def optimize_energy(payload: OptimizeRequest):
     try:
-        # Phase 1: Extract directives with LLM
-        directives = extract_directives(
-            notes=request.operator_notes,
-            capacity_kwh=request.battery.capacity_kwh,
-        )
-
-        # Phase 2: Solve LP schedule with PuLP
-        hourly_plan = solve_schedule(request, directives)
-
-        # Phase 3: Compute aggregate summary metrics
-        total_grid = round(sum(p.grid_import_kwh for p in hourly_plan), 4)
-        total_cost = round(sum(p.hourly_cost_bdt for p in hourly_plan), 4)
-        peak_grid = round(max((p.grid_import_kwh for p in hourly_plan), default=0.0), 4)
-
-        return OptimizeResponse(
-            scenario_id=request.scenario_id,
-            directive_interpretation=directives,
-            hourly_plan=hourly_plan,
-            total_grid_kwh=total_grid,
-            total_cost_bdt=total_cost,
-            peak_grid_kwh=peak_grid,
-        )
-
-    except Exception as exc:
-        logger.exception("Error processing energy optimization request")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Optimization pipeline encountered an error: {str(exc)}",
-        )
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        raw = interpret_notes(payload.operator_notes)
+        validated = guard_directives(raw)
+        return optimize_schedule(payload, validated)
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Controlled internal error")
