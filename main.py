@@ -248,6 +248,7 @@ def optimize_schedule(req: OptimizeRequest, directives: List[DirectiveInterpreta
 def health():
     return {"status": "ok"}
 
+
 @app.post("/optimize-energy", response_model=OptimizeResponse)
 def optimize_energy(payload: OptimizeRequest):
     try:

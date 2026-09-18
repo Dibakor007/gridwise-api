@@ -5,11 +5,21 @@ import logging
 from typing import List, Optional, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import pulp
-from google import genai
-from google.genai import types
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
+# Safe imports to prevent top-level module initialization crashes on Vercel Lambda
+try:
+    import pulp
+except Exception as _e:
+    pulp = None
+
+try:
+    from google import genai
+    from google.genai import types
+except Exception as _e:
+    genai = None
+    types = None
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -137,7 +147,7 @@ def fallback_parser(notes: List[str]) -> List[DirectiveInterpretation]:
 
 def interpret_notes(notes: List[str]) -> List[DirectiveInterpretation]:
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key or genai is None or types is None:
         return fallback_parser(notes)
     try:
         client = genai.Client(api_key=api_key)
@@ -171,6 +181,9 @@ def guard_directives(directives: List[DirectiveInterpretation]) -> List[Directiv
 
 # 4. Math Optimizer
 def optimize_schedule(req: OptimizeRequest, directives: List[DirectiveInterpretation]) -> OptimizeResponse:
+    if pulp is None:
+        raise HTTPException(status_code=500, detail="PuLP solver module unavailable on server")
+
     prob = pulp.LpProblem("Cost_Minimization", pulp.LpMinimize)
     grid = pulp.LpVariable.dicts("grid", range(24), lowBound=0.0)
     solar_used = pulp.LpVariable.dicts("solar_used", range(24), lowBound=0.0)
@@ -250,7 +263,8 @@ def health():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "GridWise API"}
+    return {"status": "ok"}
+
 
 @app.post("/optimize-energy", response_model=OptimizeResponse)
 def optimize_energy(payload: OptimizeRequest):
